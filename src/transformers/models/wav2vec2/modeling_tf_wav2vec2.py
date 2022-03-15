@@ -30,7 +30,10 @@ from ...file_utils import (
     replace_return_docstrings,
 )
 from ...modeling_tf_outputs import TFBaseModelOutput, TFCausalLMOutput
-from ...modeling_tf_utils import TFPreTrainedModel, booleans_processing, get_initializer, keras_serializable
+from ...modeling_tf_utils import (
+    TFPreTrainedModel, booleans_processing, get_initializer,
+    keras_serializable, unpack_inputs
+)
 from ...tf_utils import shape_list
 from ...tokenization_utils_base import BatchEncoding
 from ...utils import logging
@@ -1224,6 +1227,7 @@ class TFWav2Vec2MainLayer(tf.keras.layers.Layer):
 
         return hidden_states
 
+    @unpack_inputs
     def call(
         self,
         input_values: tf.Tensor,
@@ -1238,52 +1242,37 @@ class TFWav2Vec2MainLayer(tf.keras.layers.Layer):
         training: bool = False,
         **kwargs: Any,
     ):
-        inputs = input_values_processing(
-            func=self.call,
-            config=self.config,
-            input_values=input_values,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            training=training,
-            kwargs_call=kwargs,
-        )
 
         extract_features = self.feature_extractor(
-            tf.cast(inputs["input_values"], tf.float32), training=inputs["training"]
+            tf.cast(input_values, tf.float32), training=training
         )
         # extract_features = tf.transpose(extract_features, perm=(0, 2, 1))
 
-        if inputs["attention_mask"] is not None:
+        if attention_mask is not None:
             # compute real output lengths according to convolution formula
-            output_lengths = self._get_feat_extract_output_lengths(tf.reduce_sum(inputs["attention_mask"], -1))
+            output_lengths = self._get_feat_extract_output_lengths(tf.reduce_sum(attention_mask, -1))
 
             attention_mask = tf.sequence_mask(
                 output_lengths, maxlen=shape_list(extract_features)[1], dtype=extract_features.dtype
             )
 
-        hidden_states, extract_features = self.feature_projection(extract_features, training=inputs["training"])
+        hidden_states, extract_features = self.feature_projection(extract_features, training=training)
 
         mask_time_indices = kwargs.get("mask_time_indices", None)
-        if inputs["training"]:
+        if training:
             hidden_states = self._mask_hidden_states(hidden_states, mask_time_indices=mask_time_indices)
 
         encoder_outputs = self.encoder(
             hidden_states,
             attention_mask=attention_mask,
-            output_attentions=inputs["output_attentions"],
-            output_hidden_states=inputs["output_hidden_states"],
-            return_dict=inputs["return_dict"],
-            training=inputs["training"],
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
         )
         hidden_states = encoder_outputs[0]
 
-        if not inputs["return_dict"]:
+        if not return_dict:
             return (hidden_states, extract_features) + encoder_outputs[1:]
 
         return TFWav2Vec2BaseModelOutput(
@@ -1431,6 +1420,7 @@ class TFWav2Vec2Model(TFWav2Vec2PreTrainedModel):
         self.config = config
         self.wav2vec2 = TFWav2Vec2MainLayer(config, name="wav2vec2")
 
+    @unpack_inputs
     @add_start_docstrings_to_model_forward(WAV_2_VEC_2_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=TFBaseModelOutput, config_class=_CONFIG_FOR_DOC)
     def call(
@@ -1474,9 +1464,15 @@ class TFWav2Vec2Model(TFWav2Vec2PreTrainedModel):
         >>> hidden_states = model(input_values).last_hidden_state
         ```"""
 
-        inputs = input_values_processing(
-            func=self.call,
-            config=self.config,
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states else self.config.output_hidden_states
+        )
+        output_attentions = (
+            output_attentions if output_attentions else self.config.output_attentions
+        )
+        return_dict = return_dict if return_dict else self.config.return_dict
+
+        outputs = self.wav2vec2(
             input_values=input_values,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -1487,27 +1483,6 @@ class TFWav2Vec2Model(TFWav2Vec2PreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             training=training,
-        )
-
-        inputs["output_hidden_states"] = (
-            inputs["output_hidden_states"] if inputs["output_hidden_states"] else self.config.output_hidden_states
-        )
-        inputs["output_attentions"] = (
-            inputs["output_attentions"] if inputs["output_attentions"] else self.config.output_attentions
-        )
-        inputs["return_dict"] = inputs["return_dict"] if inputs["return_dict"] else self.config.return_dict
-
-        outputs = self.wav2vec2(
-            input_values=inputs["input_values"],
-            attention_mask=inputs["attention_mask"],
-            token_type_ids=inputs["token_type_ids"],
-            position_ids=inputs["position_ids"],
-            head_mask=inputs["head_mask"],
-            inputs_embeds=inputs["inputs_embeds"],
-            output_attentions=inputs["output_attentions"],
-            output_hidden_states=inputs["output_hidden_states"],
-            return_dict=inputs["return_dict"],
-            training=inputs["training"],
         )
 
         return outputs
@@ -1555,6 +1530,7 @@ class TFWav2Vec2ForCTC(TFWav2Vec2PreTrainedModel):
         """
         self.wav2vec2.feature_extractor.trainable = False
 
+    @unpack_inputs
     @add_start_docstrings_to_model_forward(WAV_2_VEC_2_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=TFCausalLMOutput, config_class=_CONFIG_FOR_DOC)
     def call(
@@ -1615,9 +1591,8 @@ class TFWav2Vec2ForCTC(TFWav2Vec2PreTrainedModel):
 
         >>> loss = model(input_values, labels=labels).loss
         ```"""
-        inputs = input_values_processing(
-            func=self.call,
-            config=self.config,
+
+        outputs = self.wav2vec2(
             input_values=input_values,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
@@ -1629,21 +1604,8 @@ class TFWav2Vec2ForCTC(TFWav2Vec2PreTrainedModel):
             return_dict=return_dict,
             training=training,
         )
-
-        outputs = self.wav2vec2(
-            input_values=inputs["input_values"],
-            attention_mask=inputs["attention_mask"],
-            token_type_ids=inputs["token_type_ids"],
-            position_ids=inputs["position_ids"],
-            head_mask=inputs["head_mask"],
-            inputs_embeds=inputs["inputs_embeds"],
-            output_attentions=inputs["output_attentions"],
-            output_hidden_states=inputs["output_hidden_states"],
-            return_dict=inputs["return_dict"],
-            training=inputs["training"],
-        )
         hidden_states = outputs[0]
-        hidden_states = self.dropout(hidden_states, training=inputs["training"])
+        hidden_states = self.dropout(hidden_states, training=training)
 
         logits = self.lm_head(hidden_states)
 
@@ -1653,9 +1615,9 @@ class TFWav2Vec2ForCTC(TFWav2Vec2PreTrainedModel):
                 raise ValueError(f"Label values must be <= vocab_size: {self.config.vocab_size}")
 
             attention_mask = (
-                inputs["attention_mask"]
-                if inputs["attention_mask"] is not None
-                else tf.ones_like(inputs["input_values"], dtype=tf.float32)
+                attention_mask
+                if attention_mask is not None
+                else tf.ones_like(input_values, dtype=tf.float32)
             )
             input_lengths = self.wav2vec2._get_feat_extract_output_lengths(tf.reduce_sum(attention_mask, axis=-1))
 
@@ -1680,7 +1642,7 @@ class TFWav2Vec2ForCTC(TFWav2Vec2PreTrainedModel):
         else:
             loss = None
 
-        if not inputs["return_dict"]:
+        if not return_dict:
             output = (logits,) + outputs[_HIDDEN_STATES_START_POSITION:]
             return ((loss,) + output) if loss is not None else output
 
